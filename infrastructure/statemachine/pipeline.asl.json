@@ -1,0 +1,278 @@
+{
+  "Comment": "YouTube trending Medallion ETL: ingest (Bronze) -> clean (Silver) -> DQ gate -> aggregate (Gold) -> DQ gate",
+  "StartAt": "IngestTrendingData",
+  "States": {
+    "IngestTrendingData": {
+      "Type": "Task",
+      "Comment": "Lambda pulls the mostPopular chart for every region into Bronze",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${IngestFunctionArn}",
+        "Payload": {
+          "run_id.$": "$$.Execution.Name",
+          "execution_start.$": "$$.Execution.StartTime"
+        }
+      },
+      "ResultSelector": {
+        "run_id.$": "$.Payload.run_id",
+        "ingest_date.$": "$.Payload.ingest_date",
+        "ingest_hour.$": "$.Payload.ingest_hour",
+        "video_count.$": "$.Payload.video_count",
+        "regions_succeeded.$": "$.Payload.regions_succeeded",
+        "regions_failed.$": "$.Payload.regions_failed"
+      },
+      "ResultPath": "$.ingest",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineError"
+        }
+      ],
+      "Next": "BronzeToSilver"
+    },
+    "BronzeToSilver": {
+      "Type": "Task",
+      "Comment": "Glue job cleans, types, enriches and de-duplicates this run's Bronze data",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${BronzeToSilverJobName}",
+        "Arguments": {
+          "--INGEST_DATE.$": "$.ingest.ingest_date",
+          "--INGEST_HOUR.$": "$.ingest.ingest_hour"
+        }
+      },
+      "ResultSelector": {
+        "job_run_id.$": "$.Id",
+        "state.$": "$.JobRunState",
+        "execution_time_seconds.$": "$.ExecutionTime"
+      },
+      "ResultPath": "$.silver_job",
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineError"
+        }
+      ],
+      "Next": "SilverQualityChecks"
+    },
+    "SilverQualityChecks": {
+      "Type": "Task",
+      "Comment": "Athena-based data quality suite on the Silver partition just written",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DataQualityFunctionArn}",
+        "Payload": {
+          "suite": "silver",
+          "trending_date.$": "$.ingest.ingest_date",
+          "ingest_hour.$": "$.ingest.ingest_hour",
+          "run_id.$": "$.ingest.run_id"
+        }
+      },
+      "ResultSelector": {
+        "status.$": "$.Payload.status",
+        "checks_failed.$": "$.Payload.checks_failed",
+        "results_location.$": "$.Payload.results_location"
+      },
+      "ResultPath": "$.silver_dq",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineError"
+        }
+      ],
+      "Next": "SilverQualityGate"
+    },
+    "SilverQualityGate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.silver_dq.status",
+          "StringEquals": "FAILED",
+          "Next": "NotifyQualityFailure"
+        }
+      ],
+      "Default": "SilverToGold"
+    },
+    "SilverToGold": {
+      "Type": "Task",
+      "Comment": "Glue job rebuilds the day's Gold aggregates for Athena",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${SilverToGoldJobName}",
+        "Arguments": {
+          "--TRENDING_DATE.$": "$.ingest.ingest_date"
+        }
+      },
+      "ResultSelector": {
+        "job_run_id.$": "$.Id",
+        "state.$": "$.JobRunState",
+        "execution_time_seconds.$": "$.ExecutionTime"
+      },
+      "ResultPath": "$.gold_job",
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineError"
+        }
+      ],
+      "Next": "GoldQualityChecks"
+    },
+    "GoldQualityChecks": {
+      "Type": "Task",
+      "Comment": "Reconciliation and integrity checks on the Gold tables",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DataQualityFunctionArn}",
+        "Payload": {
+          "suite": "gold",
+          "trending_date.$": "$.ingest.ingest_date",
+          "ingest_hour.$": "$.ingest.ingest_hour",
+          "run_id.$": "$.ingest.run_id"
+        }
+      },
+      "ResultSelector": {
+        "status.$": "$.Payload.status",
+        "checks_failed.$": "$.Payload.checks_failed",
+        "results_location.$": "$.Payload.results_location"
+      },
+      "ResultPath": "$.gold_dq",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineError"
+        }
+      ],
+      "Next": "GoldQualityGate"
+    },
+    "GoldQualityGate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.gold_dq.status",
+          "StringEquals": "FAILED",
+          "Next": "NotifyQualityFailure"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.silver_dq.status",
+              "StringEquals": "PASSED_WITH_WARNINGS"
+            },
+            {
+              "Variable": "$.gold_dq.status",
+              "StringEquals": "PASSED_WITH_WARNINGS"
+            }
+          ],
+          "Next": "NotifyQualityWarnings"
+        }
+      ],
+      "Default": "PipelineSucceeded"
+    },
+    "NotifyQualityWarnings": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertsTopicArn}",
+        "Subject": "YouTube trending pipeline: data quality warnings",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Next": "PipelineSucceeded"
+    },
+    "PipelineSucceeded": {
+      "Type": "Succeed"
+    },
+    "NotifyQualityFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertsTopicArn}",
+        "Subject": "YouTube trending pipeline: data quality gate FAILED",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Next": "QualityGateFailed"
+    },
+    "QualityGateFailed": {
+      "Type": "Fail",
+      "Error": "DataQualityCheckFailed",
+      "Cause": "A critical data quality check failed; see the dq_results table for details."
+    },
+    "NotifyPipelineError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertsTopicArn}",
+        "Subject": "YouTube trending pipeline: execution error",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "Cause": "A pipeline step failed; see the execution history and SNS alert for details."
+    }
+  }
+}

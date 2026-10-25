@@ -1,0 +1,842 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  YouTube Trending Data Pipeline - cloud-native Medallion (Bronze/Silver/Gold) ETL on
+  AWS Lambda, Glue, S3, Step Functions and Athena, ingesting YouTube trending data
+  for 10 regions with automated data quality gates.
+
+Parameters:
+  Regions:
+    Type: String
+    Default: US,GB,IN,CA,AU,DE,FR,JP,KR,BR
+    Description: Comma-separated ISO 3166-1 alpha-2 region codes to ingest.
+  ExpectedRegionCount:
+    Type: Number
+    Default: 10
+    Description: Number of regions in the Regions list (used by data quality checks).
+  MinRegionCount:
+    Type: Number
+    Default: 8
+    Description: Critical DQ threshold - minimum regions that must be ingested for a run to pass.
+  MaxResultsPerRegion:
+    Type: Number
+    Default: 200
+    MinValue: 1
+    MaxValue: 200
+    Description: Videos to pull per region per run (the mostPopular chart is capped at 200).
+  ApiKeyParameterName:
+    Type: String
+    Default: /youtube-trending/api-key
+    AllowedPattern: ^/.*
+    Description: SSM Parameter Store SecureString holding the YouTube Data API key (create it before deploying).
+  ScheduleExpression:
+    Type: String
+    Default: rate(6 hours)
+    Description: EventBridge Scheduler expression for pipeline runs.
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail address subscribed to pipeline/data quality alerts.
+  GlueDatabaseName:
+    Type: String
+    Default: youtube_trending
+    AllowedPattern: ^[a-z0-9_]+$
+  ProjectionStartDate:
+    Type: String
+    Default: "2025-01-01"
+    AllowedPattern: ^\d{4}-\d{2}-\d{2}$
+    Description: Earliest date for Athena partition projection.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 300
+    MemorySize: 256
+    Tracing: Active
+
+Resources:
+  # ------------------------------------------------------------------ Storage
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: bronze-to-infrequent-access
+            Status: Enabled
+            Prefix: bronze/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 30
+          - Id: expire-glue-temp
+            Status: Enabled
+            Prefix: glue-temp/
+            ExpirationInDays: 7
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataLakeBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt DataLakeBucket.Arn
+              - !Sub "${DataLakeBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ------------------------------------------------------------------ Alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: YouTube Trending Pipeline Alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ------------------------------------------------------------------ Lambda
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Pulls YouTube mostPopular charts for all regions into the Bronze layer
+      CodeUri: ../src/lambdas/ingest/
+      Handler: ingest_handler.lambda_handler
+      Environment:
+        Variables:
+          DATA_LAKE_URI: !Sub "s3://${DataLakeBucket}"
+          REGIONS: !Ref Regions
+          MAX_RESULTS_PER_REGION: !Ref MaxResultsPerRegion
+          API_KEY_PARAMETER: !Ref ApiKeyParameterName
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DataLakeBucket
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParameterName}"
+
+  IngestFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${IngestFunction}"
+      RetentionInDays: 30
+
+  DataQualityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Runs Athena data quality suites on the Silver and Gold layers
+      CodeUri: ../src/lambdas/data_quality/
+      Handler: dq_handler.lambda_handler
+      Environment:
+        Variables:
+          BUCKET: !Ref DataLakeBucket
+          GLUE_DATABASE: !Ref GlueDatabase
+          ATHENA_WORKGROUP: !Ref AthenaWorkGroup
+          EXPECTED_REGIONS: !Ref ExpectedRegionCount
+          MIN_REGIONS: !Ref MinRegionCount
+      Policies:
+        - AthenaQueryPolicy:
+            WorkGroupName: !Ref AthenaWorkGroup
+        - S3CrudPolicy:
+            BucketName: !Ref DataLakeBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - glue:GetDatabase
+                - glue:GetTable
+                - glue:GetTables
+                - glue:GetPartition
+                - glue:GetPartitions
+              Resource:
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}"
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*"
+
+  DataQualityFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DataQualityFunction}"
+      RetentionInDays: 30
+
+  # ------------------------------------------------------------------ Glue
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole"
+      Policies:
+        - PolicyName: data-lake-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${DataLakeBucket.Arn}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt DataLakeBucket.Arn
+
+  BronzeToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Description: Bronze JSON -> Silver Parquet (typing, cleansing, enrichment, quarantine, de-duplication)
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/artifacts/glue/bronze_to_silver.py"
+      DefaultArguments:
+        "--BUCKET": !Ref DataLakeBucket
+        "--job-language": python
+        "--enable-metrics": "true"
+        "--enable-observability-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-bookmark-option": job-bookmark-disable
+        "--TempDir": !Sub "s3://${DataLakeBucket}/glue-temp/"
+
+  SilverToGoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Description: Silver -> Gold daily aggregates for Athena analytics
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/artifacts/glue/silver_to_gold.py"
+      DefaultArguments:
+        "--BUCKET": !Ref DataLakeBucket
+        "--job-language": python
+        "--enable-metrics": "true"
+        "--enable-observability-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-bookmark-option": job-bookmark-disable
+        "--TempDir": !Sub "s3://${DataLakeBucket}/glue-temp/"
+
+  # ------------------------------------------------------------------ Data Catalog (partition projection: no crawlers / MSCK needed)
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: YouTube trending Medallion data lake (Silver and Gold layers)
+
+  SilverTrendingVideosTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_trending_videos
+        Description: "Silver: cleaned, typed, enriched trending video snapshots (one row per video/region/run)"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+            projection.ingest_hour.type: enum
+            projection.ingest_hour.values: "00,01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+            projection.region.type: enum
+            projection.region.values: !Ref Regions
+        PartitionKeys:
+          - {Name: trending_date, Type: string}
+          - {Name: ingest_hour, Type: string}
+          - {Name: region, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/silver/trending_videos/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: video_id, Type: "string"}
+            - {Name: title, Type: "string"}
+            - {Name: channel_id, Type: "string"}
+            - {Name: channel_title, Type: "string"}
+            - {Name: category_id, Type: "string"}
+            - {Name: category_name, Type: "string"}
+            - {Name: published_at, Type: "timestamp"}
+            - {Name: tags, Type: "array<string>"}
+            - {Name: tag_count, Type: "int"}
+            - {Name: title_length, Type: "int"}
+            - {Name: duration_seconds, Type: "int"}
+            - {Name: definition, Type: "string"}
+            - {Name: has_captions, Type: "boolean"}
+            - {Name: licensed_content, Type: "boolean"}
+            - {Name: default_audio_language, Type: "string"}
+            - {Name: view_count, Type: "bigint"}
+            - {Name: like_count, Type: "bigint"}
+            - {Name: comment_count, Type: "bigint"}
+            - {Name: engagement_rate, Type: "double"}
+            - {Name: trending_rank, Type: "int"}
+            - {Name: hours_to_trend, Type: "double"}
+            - {Name: ingested_at, Type: "timestamp"}
+            - {Name: run_id, Type: "string"}
+
+  SilverQuarantineTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_quarantine_trending_videos
+        Description: "Silver quarantine: raw records rejected by row-level quality rules"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+            projection.ingest_hour.type: enum
+            projection.ingest_hour.values: "00,01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+        PartitionKeys:
+          - {Name: trending_date, Type: string}
+          - {Name: ingest_hour, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/silver/quarantine_trending_videos/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: video_id, Type: "string"}
+            - {Name: region, Type: "string"}
+            - {Name: run_id, Type: "string"}
+            - {Name: ingested_at, Type: "timestamp"}
+            - {Name: quarantine_reason, Type: "string"}
+            - {Name: raw_record, Type: "string"}
+
+  GoldDailyVideoTrendingTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_daily_video_trending
+        Description: "Gold: one row per region/video/day with rank, snapshots and view gain"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+        PartitionKeys:
+          - {Name: trending_date, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/gold/daily_video_trending/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: region, Type: "string"}
+            - {Name: video_id, Type: "string"}
+            - {Name: title, Type: "string"}
+            - {Name: channel_id, Type: "string"}
+            - {Name: channel_title, Type: "string"}
+            - {Name: category_name, Type: "string"}
+            - {Name: published_at, Type: "timestamp"}
+            - {Name: duration_seconds, Type: "int"}
+            - {Name: best_rank, Type: "int"}
+            - {Name: latest_rank, Type: "int"}
+            - {Name: snapshots, Type: "bigint"}
+            - {Name: first_seen_at, Type: "timestamp"}
+            - {Name: last_seen_at, Type: "timestamp"}
+            - {Name: latest_view_count, Type: "bigint"}
+            - {Name: latest_like_count, Type: "bigint"}
+            - {Name: latest_comment_count, Type: "bigint"}
+            - {Name: view_gain, Type: "bigint"}
+            - {Name: engagement_rate, Type: "double"}
+            - {Name: hours_to_trend, Type: "double"}
+
+  GoldRegionDailyKpisTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_region_daily_kpis
+        Description: "Gold: daily KPIs per region"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+        PartitionKeys:
+          - {Name: trending_date, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/gold/region_daily_kpis/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: region, Type: "string"}
+            - {Name: unique_videos, Type: "bigint"}
+            - {Name: total_snapshots, Type: "bigint"}
+            - {Name: avg_views, Type: "double"}
+            - {Name: median_views, Type: "double"}
+            - {Name: avg_engagement_rate, Type: "double"}
+            - {Name: avg_hours_to_trend, Type: "double"}
+            - {Name: avg_duration_seconds, Type: "double"}
+            - {Name: hd_share, Type: "double"}
+            - {Name: captions_share, Type: "double"}
+
+  GoldRegionCategoryDailyTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_region_category_daily
+        Description: "Gold: category mix per region per day"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+        PartitionKeys:
+          - {Name: trending_date, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/gold/region_category_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: region, Type: "string"}
+            - {Name: category_name, Type: "string"}
+            - {Name: video_count, Type: "bigint"}
+            - {Name: total_views, Type: "bigint"}
+            - {Name: avg_views, Type: "double"}
+            - {Name: avg_engagement_rate, Type: "double"}
+            - {Name: share_of_videos, Type: "double"}
+
+  GoldChannelLeaderboardTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_channel_daily_leaderboard
+        Description: "Gold: channel leaderboard per region per day"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+        PartitionKeys:
+          - {Name: trending_date, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/gold/channel_daily_leaderboard/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: region, Type: "string"}
+            - {Name: channel_id, Type: "string"}
+            - {Name: channel_title, Type: "string"}
+            - {Name: videos_trending, Type: "bigint"}
+            - {Name: total_views, Type: "bigint"}
+            - {Name: best_rank, Type: "int"}
+            - {Name: leaderboard_rank, Type: "int"}
+
+  GoldCrossRegionDailyTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_cross_region_daily
+        Description: "Gold: videos trending across multiple regions per day"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+        PartitionKeys:
+          - {Name: trending_date, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/gold/cross_region_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: video_id, Type: "string"}
+            - {Name: title, Type: "string"}
+            - {Name: channel_title, Type: "string"}
+            - {Name: category_name, Type: "string"}
+            - {Name: regions_count, Type: "int"}
+            - {Name: regions, Type: "array<string>"}
+            - {Name: max_views, Type: "bigint"}
+            - {Name: best_rank, Type: "int"}
+
+  DqResultsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: dq_results
+        Description: "Data quality check results written by the DQ Lambda"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+            classification: json
+            projection.enabled: "true"
+            projection.suite.type: enum
+            projection.suite.values: "silver,gold"
+            projection.trending_date.type: date
+            projection.trending_date.format: yyyy-MM-dd
+            projection.trending_date.range: !Sub "${ProjectionStartDate},NOW"
+            projection.trending_date.interval: "1"
+            projection.trending_date.interval.unit: DAYS
+            projection.ingest_hour.type: enum
+            projection.ingest_hour.values: "00,01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+        PartitionKeys:
+          - {Name: suite, Type: string}
+          - {Name: trending_date, Type: string}
+          - {Name: ingest_hour, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/dq/results/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - {Name: check_name, Type: "string"}
+            - {Name: severity, Type: "string"}
+            - {Name: description, Type: "string"}
+            - {Name: value, Type: "double"}
+            - {Name: operator, Type: "string"}
+            - {Name: threshold, Type: "double"}
+            - {Name: passed, Type: "boolean"}
+            - {Name: run_id, Type: "string"}
+            - {Name: checked_at, Type: "string"}
+
+  # ------------------------------------------------------------------ Athena
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-analytics"
+      Description: Analytics and data quality queries for the YouTube trending pipeline
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataLakeBucket}/athena-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  TopVideosByRegionQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub "${AWS::StackName}-top-videos-by-region"
+      Description: "Top 10 trending videos per region (latest day)"
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Top 10 trending videos per region for the most recent day
+        WITH latest AS (
+            SELECT MAX(trending_date) AS d FROM gold_daily_video_trending
+        ),
+        ranked AS (
+            SELECT v.*,
+                   ROW_NUMBER() OVER (PARTITION BY region ORDER BY best_rank, latest_view_count DESC) AS rn
+            FROM gold_daily_video_trending v, latest
+            WHERE v.trending_date = latest.d
+        )
+        SELECT region, rn AS position, title, channel_title, category_name,
+               latest_view_count, view_gain, engagement_rate, hours_to_trend
+        FROM ranked
+        WHERE rn <= 10
+        ORDER BY region, rn;
+
+  CategoryMixQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub "${AWS::StackName}-category-mix-by-region"
+      Description: "Category share of trending per region (7 days)"
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Which categories dominate trending in each region (last 7 days)
+        SELECT region,
+               category_name,
+               SUM(video_count)                         AS videos,
+               ROUND(AVG(share_of_videos) * 100, 2)     AS avg_share_pct,
+               ROUND(AVG(avg_engagement_rate) * 100, 3) AS avg_engagement_pct
+        FROM gold_region_category_daily
+        WHERE trending_date >= date_format(current_date - INTERVAL '7' DAY, '%Y-%m-%d')
+        GROUP BY region, category_name
+        ORDER BY region, videos DESC;
+
+  GlobalViralVideosQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub "${AWS::StackName}-global-viral-videos"
+      Description: "Videos trending in 3+ regions (7 days)"
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Videos trending in the most regions at once (global virality)
+        SELECT trending_date, title, channel_title, category_name,
+               regions_count, array_join(regions, ', ') AS regions, max_views
+        FROM gold_cross_region_daily
+        WHERE regions_count >= 3
+          AND trending_date >= date_format(current_date - INTERVAL '7' DAY, '%Y-%m-%d')
+        ORDER BY regions_count DESC, max_views DESC
+        LIMIT 50;
+
+  ChannelLeaderboardQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub "${AWS::StackName}-channel-leaderboard"
+      Description: "Top 5 channels per region (latest day)"
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Top 5 channels per region by trending views on the most recent day
+        SELECT c.region, c.leaderboard_rank, c.channel_title, c.videos_trending, c.total_views, c.best_rank
+        FROM gold_channel_daily_leaderboard c
+        WHERE c.trending_date = (SELECT MAX(trending_date) FROM gold_channel_daily_leaderboard)
+          AND c.leaderboard_rank <= 5
+        ORDER BY c.region, c.leaderboard_rank;
+
+  RegionKpiTrendsQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub "${AWS::StackName}-region-kpi-trends"
+      Description: "Daily KPI trends per region (30 days)"
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Daily KPI trend per region: how fast do videos trend and how engaged are viewers?
+        SELECT trending_date, region, unique_videos, median_views,
+               ROUND(avg_engagement_rate * 100, 3) AS avg_engagement_pct,
+               avg_hours_to_trend,
+               ROUND(avg_duration_seconds / 60, 1) AS avg_duration_minutes,
+               ROUND(hd_share * 100, 1)            AS hd_pct
+        FROM gold_region_daily_kpis
+        WHERE trending_date >= date_format(current_date - INTERVAL '30' DAY, '%Y-%m-%d')
+        ORDER BY trending_date DESC, region;
+
+  DataQualityHistoryQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub "${AWS::StackName}-data-quality-history"
+      Description: "Failed data quality checks (14 days)"
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Data quality check history: failures and warnings over the last 14 days
+        SELECT trending_date, ingest_hour, suite, check_name, severity, value, operator, threshold, checked_at
+        FROM dq_results
+        WHERE passed = false
+          AND trending_date >= date_format(current_date - INTERVAL '14' DAY, '%Y-%m-%d')
+        ORDER BY checked_at DESC;
+
+  # ------------------------------------------------------------------ Orchestration
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${AWS::StackName}-pipeline"
+      RetentionInDays: 30
+
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-pipeline"
+      DefinitionUri: statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        IngestFunctionArn: !GetAtt IngestFunction.Arn
+        DataQualityFunctionArn: !GetAtt DataQualityFunction.Arn
+        BronzeToSilverJobName: !Ref BronzeToSilverJob
+        SilverToGoldJobName: !Ref SilverToGoldJob
+        AlertsTopicArn: !Ref AlertsTopic
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Tracing:
+        Enabled: true
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref IngestFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DataQualityFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - glue:StartJobRun
+                - glue:GetJobRun
+                - glue:GetJobRuns
+                - glue:BatchStopJobRun
+              Resource:
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${BronzeToSilverJob}"
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${SilverToGoldJob}"
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey
+                - kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "sns.${AWS::Region}.amazonaws.com"
+            - Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+      Events:
+        Schedule:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub "${AWS::StackName}-schedule"
+            Description: Periodic YouTube trending ingestion
+            ScheduleExpression: !Ref ScheduleExpression
+            State: !Ref ScheduleState
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A YouTube trending pipeline execution failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref PipelineStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  DataLakeBucketName:
+    Description: S3 bucket holding the Bronze, Silver and Gold layers
+    Value: !Ref DataLakeBucket
+  StateMachineArn:
+    Description: Step Functions pipeline (start an execution to run on demand)
+    Value: !Ref PipelineStateMachine
+  GlueDatabase:
+    Description: Glue Data Catalog database to query in Athena
+    Value: !Ref GlueDatabase
+  AthenaWorkGroup:
+    Description: Athena workgroup with the saved analytics queries
+    Value: !Ref AthenaWorkGroup
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+  IngestFunctionName:
+    Value: !Ref IngestFunction
+  GlueScriptsLocation:
+    Description: Upload the Glue job scripts here (scripts/deploy.py does it for you)
+    Value: !Sub "s3://${DataLakeBucket}/artifacts/glue/"

@@ -1,0 +1,23 @@
+[project]
+name = "youtube-trending-data-pipeline"
+version = "1.0.0"
+description = "Cloud-native Medallion ETL for YouTube trending data on AWS Lambda, Glue, S3, Step Functions and Athena."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["UP007", "SIM105", "SIM108"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ingest_handler", "dq_handler", "rules", "bronze_to_silver", "silver_to_gold", "fake_youtube_api", "run_local"]

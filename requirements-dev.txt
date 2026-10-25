@@ -1,0 +1,9 @@
+# Local development, tests and the offline runner.
+# The Lambda functions use only the Python standard library + boto3 (already in the Lambda runtime).
+pyspark==3.5.4        # same Spark version as AWS Glue 5.0
+boto3>=1.34
+pyyaml>=6.0
+pytest>=8.0
+moto[s3,ssm]>=5.0
+cfn-lint>=1.0
+ruff>=0.5

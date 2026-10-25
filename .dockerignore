@@ -1,0 +1,6 @@
+.git
+local_lake
+.aws-sam
+**/__pycache__
+.pytest_cache
+.ruff_cache

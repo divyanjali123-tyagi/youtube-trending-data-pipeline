@@ -1,0 +1,42 @@
+
+[local-20261025T03] ingest: 510 videos from 10 regions
+  bronze -> silver: {'silver_rows': 480, 'quarantined_rows': 20}
+  DQ silver -> PASSED (10 checks)
+  silver -> gold:   {'daily_video_trending': 480, 'region_daily_kpis': 10, 'region_category_daily': 118, 'channel_daily_leaderboard': 394, 'cross_region_daily': 410}
+  DQ gold   -> PASSED (6 checks)
+
+[local-20261025T09] ingest: 510 videos from 10 regions
+  bronze -> silver: {'silver_rows': 480, 'quarantined_rows': 20}
+  DQ silver -> PASSED (10 checks)
+  silver -> gold:   {'daily_video_trending': 480, 'region_daily_kpis': 10, 'region_category_daily': 118, 'channel_daily_leaderboard': 394, 'cross_region_daily': 410}
+  DQ gold   -> PASSED (6 checks)
+
+=== Region KPIs (gold_region_daily_kpis) ===
++------+-------------+------------+-------------------+------------------+--------+
+|region|unique_videos|median_views|avg_engagement_rate|avg_hours_to_trend|hd_share|
++------+-------------+------------+-------------------+------------------+--------+
+|AU    |48           |539582.0    |0.048704           |44.65             |0.8958  |
+|BR    |48           |666457.0    |0.047478           |48.44             |0.6875  |
+|CA    |48           |773236.0    |0.05515            |45.75             |0.75    |
+|DE    |48           |540481.0    |0.045795           |47.35             |0.6458  |
+|FR    |48           |624912.0    |0.045309           |51.04             |0.7292  |
+|GB    |48           |398174.0    |0.050463           |52.5              |0.875   |
+|IN    |48           |594817.0    |0.048597           |50.85             |0.7917  |
+|JP    |48           |583881.0    |0.043816           |45.23             |0.875   |
+|KR    |48           |868087.0    |0.051213           |44.94             |0.8333  |
+|US    |48           |352368.0    |0.046956           |50.56             |0.6875  |
++------+-------------+------------+-------------------+------------------+--------+
+
+=== Videos trending in the most regions (gold_cross_region_daily) ===
++----------------------------------------+-------------+------------------------+---------+
+|                                   title|regions_count|                 regions|max_views|
++----------------------------------------+-------------+------------------------+---------+
+|Sample trending video #9 - Entertainment|            6|[AU, BR, CA, FR, IN, US]|   482080|
+|      Sample trending video #23 - Gaming|            6|[AU, CA, DE, IN, KR, US]|   156787|
+|Sample trending video #16 - People & ...|            5|    [AU, BR, DE, GB, JP]|   623130|
+|Sample trending video #7 - People & B...|            4|        [AU, CA, IN, KR]|   512729|
+|      Sample trending video #39 - Sports|            4|        [BR, GB, IN, JP]|   480492|
++----------------------------------------+-------------+------------------------+---------+
+only showing top 5 rows
+
+Lake written to: ./local_lake
